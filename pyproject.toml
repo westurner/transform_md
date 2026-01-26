@@ -16,7 +16,9 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
-dependencies = []
+dependencies = [
+    "PyYAML",
+]
 
 [project.optional-dependencies]
 test = [
@@ -35,3 +37,4 @@ include = ["transform_md*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-v --cov=. --cov-report=term-missing"
