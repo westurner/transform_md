@@ -1,43 +1,186 @@
-"""Transform exported Gemini chat markdown into improved markdown.
+"""Extensible Markdown and Jupyter Notebook Transformation Framework.
 
-This module provides a simple `transform_text` function which currently
-replaces lines that equal "Code snippet" with a mermaid code-fence
-starter (```mermaid). It also exposes a small CLI to transform files.
+This module provides tools for normalizing AI-generated chat exports, syncing markdown 
+with Jupyter notebooks (.ipynb), and supporting multiple markdown dialects (MyST, Quarto).
+It features a pluggable registry (REGISTRY) for custom format extensions and 
+configurable text transforms (such as 'code_snippet' and 'chat_split').
 """
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import hashlib
 import mimetypes
 import urllib.request
 import urllib.parse
+from enum import Enum
 from pathlib import Path
 from typing import Iterable
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+
+class MarkdownConfig:
+    """Configuration for a specific markdown format."""
+    def __init__(
+        self,
+        name: str,
+        extensions: list[str] | None = None,
+        default_transforms: list[str] | None = None,
+        cell_fence_template: str = "```{lang}",
+        cell_metadata_style: str = "yaml",
+        chat_prompt_re: str | None = None,
+        chat_response_re: str | None = None,
+        chat_split_mode: str | None = None
+    ):
+        self.name = name
+        self.extensions = extensions or []
+        self.default_transforms = default_transforms or ["close_fences", "collapse_blanks"]
+        self.cell_fence_template = cell_fence_template
+        self.cell_metadata_style = cell_metadata_style
+        self.chat_prompt_re = chat_prompt_re
+        self.chat_response_re = chat_response_re
+        self.chat_split_mode = chat_split_mode
+
+    def is_transform_enabled(self, transform: str, explicitly_enabled: Iterable[str] | None = None) -> bool:
+        """Check if a transform is enabled for this format."""
+        if explicitly_enabled is not None:
+            return transform in explicitly_enabled
+        return transform in self.default_transforms
+
+
+class MarkdownFormat(Enum):
+    """Legacy enum for markdown formats. Use REGISTRY for expansion."""
+    CHATEXPORT_ABC1 = "chatexport_abc1"
+    MYST = "myst"
+    QMD = "qmd"
+    STANDARD = "standard"
+
+
+class MarkdownRegistry:
+    """Registry for markdown formats."""
+    def __init__(self):
+        self._formats: dict[str, MarkdownConfig] = {}
+        self._ext_map: dict[str, str] = {}
+
+    def register(self, config: MarkdownConfig) -> None:
+        """Register a new markdown format."""
+        self._formats[config.name] = config
+        for ext in config.extensions:
+            self._ext_map[ext] = config.name
+
+    def get(self, val: str | MarkdownFormat | MarkdownConfig | None) -> MarkdownConfig:
+        """Get a format by name, enum, or config, defaulting to 'standard'."""
+        if val is None:
+            return self._formats.get("standard", MarkdownConfig(name="standard"))
+        if isinstance(val, MarkdownConfig):
+            return val
+        
+        # Try to handle MarkdownConfig if it's from a different module instance
+        if hasattr(val, "name") and hasattr(val, "cell_fence_template"):
+            return val # type: ignore
+
+        name = val.value if isinstance(val, MarkdownFormat) else val
+        if name and name in self._formats:
+            return self._formats[name]
+        return self._formats.get("standard", MarkdownConfig(name="standard"))
+
+    def infer(self, path: Path) -> MarkdownConfig:
+        """Infer the format from a file path based on registered extensions."""
+        # Sort by length descending to match '.myst.md' before '.md'
+        sorted_exts = sorted(self._ext_map.keys(), key=len, reverse=True)
+        filename = path.name.lower()
+        for ext in sorted_exts:
+            if filename.endswith(ext.lower()):
+                return self.get(self._ext_map[ext])
+        return self.get("standard")
+
+    @property
+    def format_names(self) -> list[str]:
+        """List all registered format names."""
+        return list(self._formats.keys())
+
+
+# Global registry instance
+REGISTRY = MarkdownRegistry()
+
+# Register default formats
+REGISTRY.register(MarkdownConfig(
+    name="chatexport_abc1",
+    extensions=[".md"],
+    default_transforms=[
+        "chat_cleanup", "chat_headings", "code_snippet", "close_fences", "collapse_blanks", "generate_toc", "chat_input_metadata", "chat_hide_thoughts"
+    ],
+    chat_prompt_re=r"(?i)^You asked:?\s*\n[-=]+\s*$",
+    chat_response_re=r"(?i)^(?:---\n)?Gemini Replied:?\s*\n[-=]+\s*$"
+))
+REGISTRY.register(MarkdownConfig(
+    name="myst",
+    extensions=[".myst.md"],
+    cell_fence_template="```{{code-cell}} {lang}"
+))
+REGISTRY.register(MarkdownConfig(
+    name="qmd",
+    extensions=[".qmd"],
+    cell_fence_template="```{{{lang}}}",
+    cell_metadata_style="quarto"
+))
+REGISTRY.register(MarkdownConfig(
+    name="standard",
+    extensions=[]
+))
 
 
 DEFAULT_TRANSFORMS = [
     "code_snippet",
     "close_fences",
     "collapse_blanks",
+    "chat_cleanup",
+    "chat_headings",
+    "generate_toc",
+    "chat_input_metadata",
+    "chat_hide_thoughts",
 ]
 
 
-def transform_text(text: str, enabled: Iterable[str] | None = None) -> str:
+def _slugify(text: str) -> str:
+    """Generate a GitHub-style anchor slug from heading text."""
+    text = text.lower().strip()
+    # Remove everything except alphanumeric, spaces, hyphens, underscores
+    text = re.sub(r'[^\w\s-]', '', text)
+    # Replace spaces and multiple hyphens with single hyphen
+    text = re.sub(r'[-\s]+', '-', text)
+    return text
+
+
+def transform_text(text: str, enabled: Iterable[str] | None = None, format: str | MarkdownFormat | MarkdownConfig = "chatexport_abc1") -> str:
     """Transform the input markdown text.
 
-    New transforms:
+    If format is CHATEXPORT_ABC1 (Gemini):
     - Lines matching `Code snippet` optionally with `(lang)` become code-fence openers
       like ```lang (defaults to `mermaid`). Case-insensitive and allows an optional
       trailing colon.
     - Auto-closes a mermaid block started from `Code snippet` when a blank line
       follows content, inserting a blank line before and after the closing fence.
+      Trailing newline is simplified.
     - Auto-closes any unclosed triple-backtick fence at EOF.
     - Collapse runs of more than two consecutive blank lines into two.
     """
-    code_snip_re = re.compile(r"^\s*Code snippet(?:\s*\((?P<lang>[^)]+)\))?\s*:?$", re.I)
+    config = REGISTRY.get(format)
 
-    enabled_set = set(enabled) if enabled is not None else set(DEFAULT_TRANSFORMS)
+    code_snip_re = re.compile(r"^\s*Code snippet(?:\s*\((?P<lang>[^)]+)\))?\s*:?$", re.I)
+    cleanup_re = re.compile(r"^\s*(Show thinking|Export to sheets)\s*$", re.I)
+
+    prompt_re = re.compile(config.chat_prompt_re, re.M) if config.chat_prompt_re else None
+    response_re = re.compile(config.chat_response_re, re.M) if config.chat_response_re else None
+
+    # Track prompt numbers for chat_headings
+    prompt_n = 0
+    response_n = 0
 
     out_lines: list[str] = []
 
@@ -46,11 +189,43 @@ def transform_text(text: str, enabled: Iterable[str] | None = None) -> str:
     generic_fence_open = False
 
     blank_run = 0
+    skip_lines = 0
 
     lines = text.splitlines()
-    for line in lines:
+    for i, line in enumerate(lines):
+        if skip_lines > 0:
+            skip_lines -= 1
+            continue
+
+        if config.is_transform_enabled('chat_headings', explicitly_enabled=enabled):
+            remaining = "\n".join(lines[i:])
+            if prompt_re and (m := prompt_re.match(remaining)):
+                prompt_n += 1
+                match_text = m.group(0)
+                out_lines.extend(match_text.splitlines())
+                out_lines.append("")
+                out_lines.append(f"# Prompt: {prompt_n}")
+                out_lines.append("")
+                skip_lines = match_text.count("\n")
+                continue
+            elif response_re and (m := response_re.match(remaining)):
+                response_n += 1
+                match_text = m.group(0)
+                out_lines.extend(match_text.splitlines())
+                out_lines.append("")
+                out_lines.append(f"# Response: {response_n}")
+                out_lines.append("")
+                skip_lines = match_text.count("\n")
+                continue
+
+        if config.is_transform_enabled('chat_cleanup', explicitly_enabled=enabled):
+            # If hiding thoughts is enabled, we keep "Show thinking" for the splitting phase
+            is_thinking = line.strip().lower() == "show thinking"
+            if cleanup_re.fullmatch(line) and not (is_thinking and config.is_transform_enabled('chat_hide_thoughts', explicitly_enabled=enabled)):
+                continue
+
         m = code_snip_re.fullmatch(line.strip())
-        if m and 'code_snippet' in enabled_set:
+        if m and config.is_transform_enabled('code_snippet', explicitly_enabled=enabled):
             lang = (m.group('lang') or 'mermaid').strip()
             out_lines.append(f"```{lang}")
             if lang.lower() == 'mermaid':
@@ -64,7 +239,7 @@ def transform_text(text: str, enabled: Iterable[str] | None = None) -> str:
         # Toggle generic fence state on explicit ``` lines
         if line.strip().startswith('```'):
             out_lines.append(line)
-            if 'close_fences' in enabled_set:
+            if config.is_transform_enabled('close_fences', explicitly_enabled=enabled):
                 generic_fence_open = not generic_fence_open
                 if mermaid_open:
                     mermaid_open = False
@@ -73,7 +248,7 @@ def transform_text(text: str, enabled: Iterable[str] | None = None) -> str:
             continue
 
         if mermaid_open:
-            if 'close_fences' in enabled_set and line.strip() == '' and mermaid_has_content:
+            if config.is_transform_enabled('close_fences', explicitly_enabled=enabled) and line.strip() == '' and mermaid_has_content:
                 out_lines.append('')
                 out_lines.append('```')
                 out_lines.append('')
@@ -90,7 +265,7 @@ def transform_text(text: str, enabled: Iterable[str] | None = None) -> str:
         # Normal line handling: collapse excessive blank runs
         if line.strip() == '':
             blank_run += 1
-            if 'collapse_blanks' not in enabled_set or blank_run <= 2:
+            if not config.is_transform_enabled('collapse_blanks', explicitly_enabled=enabled) or blank_run <= 2:
                 out_lines.append('')
             continue
 
@@ -98,7 +273,7 @@ def transform_text(text: str, enabled: Iterable[str] | None = None) -> str:
         out_lines.append(line)
 
     # close any open fences at EOF (if enabled)
-    if 'close_fences' in enabled_set:
+    if config.is_transform_enabled('close_fences', explicitly_enabled=enabled):
         if mermaid_open and mermaid_has_content:
             out_lines.append('')
             out_lines.append('```')
@@ -108,10 +283,478 @@ def transform_text(text: str, enabled: Iterable[str] | None = None) -> str:
             out_lines.append('```')
             generic_fence_open = False
 
+    # TOC transform: generate from final out_lines
+    if config.is_transform_enabled('generate_toc', explicitly_enabled=enabled):
+        # Skip if already exists
+        if not any(re.match(r"^##\s+Contents\s*$", l, re.I) for l in out_lines):
+            toc_entries = []
+            i = 0
+            while i < len(out_lines):
+                line = out_lines[i]
+                
+                # Skip if it matches a chat delimiter (they will be removed during splitting)
+                # We check the raw line content for speed first
+                line_stripped = line.strip()
+                if line_stripped.lower().startswith(("you asked", "gemini replied")):
+                    remaining = "\n".join(out_lines[i:])
+                    m_p = prompt_re.match(remaining) if prompt_re else None
+                    m_r = response_re.match(remaining) if response_re else None
+                    m = m_p or m_r
+                    if m:
+                        i += m.group(0).count("\n") + 1
+                        continue
+
+                # ATX: # Heading
+                m_atx = re.match(r"^(#+)\s+(.+)$", line_stripped)
+                if m_atx:
+                    level = len(m_atx.group(1))
+                    title = m_atx.group(2).strip()
+                    is_chat_h = re.match(r"^(Prompt|Response):\s+\d+$", title, re.I)
+                    if title.lower() != "contents" and not is_chat_h:
+                        toc_entries.append((level, title))
+                # Setext: Line\n=== or Line\n---
+                elif i + 1 < len(out_lines):
+                    next_line = out_lines[i+1].strip()
+                    # A setext heading line itself shouldn't be too long or empty
+                    if line_stripped and next_line and len(next_line) >= 3 and all(c == next_line[0] for c in next_line) and next_line[0] in '=-':
+                        title = line_stripped
+                        level = 1 if next_line[0] == '=' else 2
+                        if title.lower() != "contents":
+                            toc_entries.append((level, title))
+                i += 1
+            
+            if toc_entries:
+                toc_lines = ["## Contents", ""]
+                for level, title in toc_entries:
+                    slug = _slugify(title)
+                    indent = "  " * (level - 1)
+                    toc_lines.append(f"{indent}* [{title}](#{slug})")
+                toc_lines.append("")
+                
+                # Insert at the top (after frontmatter if present)
+                insert_pos = 0
+                if out_lines and out_lines[0].startswith("---"):
+                    try:
+                        # simplistic toggle check for second ---
+                        for idx in range(1, len(out_lines)):
+                            if out_lines[idx].startswith("---"):
+                                insert_pos = idx + 1
+                                break
+                    except Exception:
+                        pass
+                
+                final_toc = []
+                if insert_pos > 0:
+                    final_toc.append("")
+                final_toc.extend(toc_lines)
+
+                out_lines = out_lines[:insert_pos] + final_toc + out_lines[insert_pos:]
+
     if text.endswith('\n'):
         return '\n'.join(out_lines) + '\n'
     return '\n'.join(out_lines)
+
+
+def _get_chat_segments(text: str, prompt_re_str: str | None, response_re_str: str | None) -> list[dict]:
+    """Split text into a list of {'type': 'prompt'|'response'|'other', 'content': str}."""
+    BOUNDARIES = []
+    if prompt_re_str:
+        for m in re.finditer(prompt_re_str, text, re.M):
+            BOUNDARIES.append(('prompt', m.start(), m.end()))
+    if response_re_str:
+        for m in re.finditer(response_re_str, text, re.M):
+            BOUNDARIES.append(('response', m.start(), m.end()))
+
+    BOUNDARIES.sort(key=lambda x: x[1])
+
+    segments = []
+    last_pos = 0
+    current_type = 'other'
+
+    for btype, start, end in BOUNDARIES:
+        # segment before this header
+        content = text[last_pos:start].strip('\r\n')
+        if content or segments:
+            segments.append({'type': current_type, 'content': content})
+        last_pos = end # Start next segment AFTER the header (delimiter)
+        current_type = btype
+
+    # last segment
+    content = text[last_pos:].strip('\r\n')
+    if content or (not segments and last_pos > 0):
+        segments.append({'type': current_type, 'content': content})
+
+    return segments
+
+
+def _md_to_notebook_chat(text: str, config: MarkdownConfig, mode: str, metadata: dict, enabled: Iterable[str] | None = None) -> dict:
+    """Specialized notebook converter for chat turn splitting (m1, m2)."""
+    segments = _get_chat_segments(text, config.chat_prompt_re, config.chat_response_re)
     
+    # If chat_headings is enabled, split segments further to ensure each heading is its own cell
+    if config.is_transform_enabled('chat_headings', explicitly_enabled=enabled):
+        h_segments = []
+        for seg in segments:
+            # Split content by chat headings, keeping the headings in the result
+            parts = re.split(r"(^# (?:Prompt|Response): \d+\s*$)", seg['content'], flags=re.MULTILINE)
+            for p in parts:
+                if not p.strip('\r\n'):
+                    continue
+                is_h = re.match(r"^# (?:Prompt|Response): \d+\s*$", p.strip())
+                h_segments.append({
+                    'type': 'heading' if is_h else seg['type'],
+                    'content': p.strip('\r\n')
+                })
+        segments = h_segments
+
+    # If chat_hide_thoughts is enabled, split out thoughts from response segments
+    if config.is_transform_enabled('chat_hide_thoughts', explicitly_enabled=enabled):
+        t_segments = []
+        # Keywords based on Lignolux and standard Gemini thought patterns
+        thought_keywords = r"\b(Thinking|Thought|I'm|I am|I’ve|I’m|I've|I have|I'll|I will|I shall|I aim|My focus|My research|My analysis|I'm now|I'm currently|Beginning query|Summarizing|Verifying|Considering|Examining|Initiating|Analyzing|Refining|Adjusting|Defining)\b"
+        
+        for seg in segments:
+            if seg['type'] == 'response':
+                content = seg['content']
+                sub_parts = re.split(r"(^Show thinking\s*$)", content, flags=re.MULTILINE | re.I)
+                for part in sub_parts:
+                    if re.match(r"^Show thinking\s*$", part, re.I):
+                        t_segments.append({'type': 'thought', 'content': part})
+                    else:
+                        blocks = re.split(r"\n\n+", part)
+                        thought_blocks = []
+                        response_blocks = []
+                        in_thoughts = True
+                        for b in blocks:
+                            if not b.strip('\r\n'): continue
+                            is_b_thought = False
+                            b_check = b.strip()
+                            if b_check.startswith("**") and re.search(thought_keywords, b_check, re.I):
+                                is_b_thought = True
+                            elif re.match(r"^(?:I'm|I am|I’m)\s+(?:currently|now|focused|exploring|investigating)\b", b_check, re.I):
+                                is_b_thought = True
+                            elif b_check.lower() == "thinking...":
+                                is_b_thought = True
+                            
+                            if is_b_thought and in_thoughts:
+                                thought_blocks.append(b.strip('\r\n'))
+                            else:
+                                in_thoughts = False
+                                response_blocks.append(b.strip('\r\n'))
+                        
+                        if thought_blocks:
+                            t_segments.append({'type': 'thought', 'content': "\n\n".join(thought_blocks)})
+                        if response_blocks:
+                            t_segments.append({'type': 'response', 'content': "\n\n".join(response_blocks)})
+            else:
+                t_segments.append(seg)
+        segments = t_segments
+
+    cells = []
+
+    if mode == "m1":
+        for seg in segments:
+            if not seg['content']:
+                continue
+
+            cell_meta = {}
+            is_prompt = (seg['type'] == 'prompt' or (seg['type'] == 'heading' and '# Prompt:' in seg['content']))
+            if is_prompt and config.is_transform_enabled('chat_input_metadata', explicitly_enabled=enabled):
+                cell_meta['chat_input'] = True
+
+            if seg['type'] == 'thought':
+                cell_meta.update({
+                    "collapsed": True,
+                    "jupyter": {"source_hidden": True}
+                })
+
+            cells.append({
+                "cell_type": "markdown",
+                "metadata": cell_meta,
+                "source": [line + "\n" for line in seg['content'].splitlines()]
+            })
+    elif mode == "m2":
+        i = 0
+        while i < len(segments):
+            seg = segments[i]
+            if seg['type'] == 'prompt':
+                prompt_content = seg['content']
+                response_content = ""
+                # group any following 'response' segments (and skip 'thought' which are handled separately)
+                if i + 1 < len(segments) and segments[i+1]['type'] == 'response':
+                    response_content = segments[i+1]['content']
+                    i += 1
+
+                # escape triple quotes for the python string
+                escaped_prompt = prompt_content.replace('"""', '\\"\\"\\"')
+
+                cell_meta = {}
+                if config.is_transform_enabled('chat_input_metadata', explicitly_enabled=enabled):
+                    cell_meta['chat_input'] = True
+
+                cells.append({
+                    "cell_type": "code",
+                    "execution_count": None,
+                    "metadata": cell_meta,
+                    "outputs": [
+                        {
+                            "output_type": "display_data",
+                            "data": {
+                                "text/markdown": [line + "\n" for line in response_content.splitlines()]
+                            },
+                            "metadata": {}
+                        }
+                    ] if response_content else [],
+                    "source": [
+                        'promptstr("""\n',
+                        *[line + "\n" for line in escaped_prompt.splitlines()],
+                        '""")\n'
+                    ]
+                })
+            else:
+                # 'other' or stray 'response' or 'thought' or 'heading'
+                if seg['content']:
+                    cell_meta = {}
+                    if seg['type'] == 'thought':
+                        cell_meta.update({
+                            "collapsed": True,
+                            "jupyter": {"source_hidden": True}
+                        })
+                    cells.append({
+                        "cell_type": "markdown",
+                        "metadata": cell_meta,
+                        "source": [line + "\n" for line in seg['content'].splitlines()]
+                    })
+            i += 1
+
+    if "kernelspec" not in metadata:
+        metadata["kernelspec"] = {
+            "display_name": "Python 3",
+            "language": "python",
+            "name": "python3"
+        }
+
+    return {
+        "cells": cells,
+        "metadata": metadata,
+        "nbformat": 4,
+        "nbformat_minor": 5
+    }
+
+
+def md_to_notebook(text: str, enabled_transforms: Iterable[str] | None = None, format: str | MarkdownFormat | MarkdownConfig = "standard") -> dict:
+    """Convert markdown text to an .ipynb-compatible dictionary.
+
+    Runs transform_text first.
+    Supports YAML front-matter and MyST/Quarto-style code cells.
+    Also supports chat splitting modes (m1, m2) if configured or enabled via transforms.
+    """
+    config = REGISTRY.get(format)
+
+    cleaned = transform_text(text, enabled=enabled_transforms, format=config)
+
+    metadata = {}
+    content = cleaned
+
+    # Extract front-matter
+    fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+    if fm_match:
+        if yaml:
+            try:
+                metadata = yaml.safe_load(fm_match.group(1)) or {}
+            except Exception:
+                pass
+        content = content[fm_match.end():]
+
+    mode = config.chat_split_mode
+    if enabled_transforms:
+        if "chat_split_m1" in enabled_transforms:
+            mode = "m1"
+        elif "chat_split_m2" in enabled_transforms:
+            mode = "m2"
+
+    if mode in ["m1", "m2"]:
+        return _md_to_notebook_chat(content, config, mode, metadata, enabled=enabled_transforms)
+
+    if "kernelspec" not in metadata:
+        metadata["kernelspec"] = {
+            "display_name": "Python 3",
+            "language": "python",
+            "name": "python3"
+        }
+
+    cells = []
+
+    # Match code fences: ```[ { ]lang[ } ]
+    # Also handles MyST {code-cell} format and Quarto {lang}
+    fence_re = re.compile(r"^```(?:\{)?([^\s\}]+)(?:\})?.*?\n(.*?)\n```", re.MULTILINE | re.DOTALL)
+
+    last_pos = 0
+    for match in fence_re.finditer(content):
+        # markdown before
+        md_part = content[last_pos:match.start()].strip()
+        if md_part:
+            cell_meta = {}
+            # Check for MyST-style markdown cell metadata
+            inner_fm = re.match(r"^---\s*\n(.*?)\n---\s*\n", md_part, re.DOTALL)
+            if inner_fm and yaml:
+                try:
+                    cell_meta.update(yaml.safe_load(inner_fm.group(1)) or {})
+                    md_part = md_part[inner_fm.end():]
+                except Exception:
+                    pass
+
+            cells.append({
+                "cell_type": "markdown",
+                "metadata": cell_meta,
+                "source": [line + "\n" for line in md_part.splitlines()]
+            })
+
+        lang_input = match.group(1).strip().lower()
+        code_content = match.group(2)
+        cell_metadata = {}
+
+        is_code = True
+        lang = lang_input
+        if "code-cell" in lang_input:
+            lang = "python"  # default for code-cell
+        elif lang_input in ["markdown", "md", "text"]:
+            is_code = False
+
+        # Parse internal metadata
+        # 1. MyST style: --- YAML ---
+        inner_fm = re.match(r"^---\s*\n(.*?)\n---\s*\n", code_content, re.DOTALL)
+        if inner_fm:
+            if yaml:
+                try:
+                    cell_metadata.update(yaml.safe_load(inner_fm.group(1)) or {})
+                except Exception:
+                    pass
+            code_content = code_content[inner_fm.end():]
+
+        # 2. Quarto style: #| key: value
+        if is_code:
+            q_lines = []
+            for line in code_content.splitlines():
+                if line.startswith("#|"):
+                    if yaml:
+                        try:
+                            # Parse Quarto directive
+                            part = line[2:].strip()
+                            if ":" in part:
+                                k, v = part.split(":", 1)
+                                cell_metadata[k.strip()] = yaml.safe_load(v.strip())
+                        except Exception:
+                            pass
+                else:
+                    q_lines.append(line)
+            if cell_metadata: # If we found any #| metadata, update code_content
+                 code_content = "\n".join(q_lines)
+
+        if is_code:
+            cell_metadata["language"] = lang
+            cells.append({
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": cell_metadata,
+                "outputs": [],
+                "source": [line + "\n" for line in code_content.splitlines()]
+            })
+        else:
+            cells.append({
+                "cell_type": "markdown",
+                "metadata": cell_metadata,
+                "source": [line + "\n" for line in code_content.splitlines()]
+            })
+
+        last_pos = match.end()
+
+    # tail
+    md_tail = content[last_pos:].strip()
+    if md_tail:
+        cell_meta = {}
+        inner_fm = re.match(r"^---\s*\n(.*?)\n---\s*\n", md_tail, re.DOTALL)
+        if inner_fm and yaml:
+            try:
+                cell_meta.update(yaml.safe_load(inner_fm.group(1)) or {})
+                md_tail = md_tail[inner_fm.end():]
+            except Exception:
+                pass
+
+        cells.append({
+            "cell_type": "markdown",
+            "metadata": cell_meta,
+            "source": [line + "\n" for line in md_tail.splitlines()]
+        })
+
+    return {
+        "cells": cells,
+        "metadata": metadata,
+        "nbformat": 4,
+        "nbformat_minor": 5
+    }
+
+
+def notebook_to_md(nb: dict, format: str | MarkdownFormat | MarkdownConfig = "standard") -> str:
+    """Convert an .ipynb dictionary back to markdown."""
+    config = REGISTRY.get(format)
+    lines = []
+    metadata = nb.get("metadata", {})
+    if metadata and yaml:
+        lines.append("---")
+        lines.append(yaml.dump(metadata).strip())
+        lines.append("---")
+        lines.append("")
+
+    for cell in nb.get("cells", []):
+        ctype = cell.get("cell_type", "markdown")
+        source = cell.get("source", [])
+        if isinstance(source, list):
+            source_text = "".join(source)
+        else:
+            source_text = str(source)
+
+        cmeta = cell.get("metadata", {})
+
+        if ctype == "markdown":
+            if cmeta and yaml:
+                # MyST style markdown cell metadata
+                if config.name == "myst" or config.cell_metadata_style == "yaml":
+                    lines.append("---")
+                    lines.append(yaml.dump(cmeta).strip())
+                    lines.append("---")
+            lines.append(source_text.strip())
+            lines.append("")
+        else:
+            # code cell
+            lang = cmeta.get("language")
+            if not lang:
+                if "kernelspec" in metadata:
+                    lang = metadata["kernelspec"].get("language", "python")
+                else:
+                    lang = "python"
+
+            lines.append(config.cell_fence_template.format(lang=lang))
+
+            if cmeta and yaml:
+                display_meta = {k: v for k, v in cmeta.items() if k != "language"}
+                if display_meta:
+                    if config.cell_metadata_style == "quarto":
+                        # Quarto prefer #|
+                        for k, v in display_meta.items():
+                            val_str = yaml.dump(v).strip()
+                            lines.append(f"#| {k}: {val_str}")
+                    else:
+                        lines.append("---")
+                        lines.append(yaml.dump(display_meta).strip())
+                        lines.append("---")
+            lines.append(source_text.rstrip())
+            lines.append("```")
+            lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
 def _download_and_replace_images(text: str, out_dir: Path) -> str:
     """Find `![Image of ...](http...)` tags, download images to out_dir/images and replace URLs.
 
@@ -176,38 +819,124 @@ def _download_and_replace_images(text: str, out_dir: Path) -> str:
     return new_text
 
 
-def transform_file(in_path: Path, out_path: Path | None = None, enabled: Iterable[str] | None = None, download_images: bool = False) -> Path:
+def infer_format(path: Path) -> MarkdownConfig:
+    """Infer the markdown format from the file extension."""
+    return REGISTRY.infer(path)
+
+
+def transform_file(
+    in_path: Path, 
+    out_path: Path | None = None, 
+    in_transforms: Iterable[str] | None = None, 
+    out_transforms: Iterable[str] | None = None, 
+    download_images: bool = False, 
+    in_format: str | MarkdownFormat | MarkdownConfig | None = None,
+    out_format: str | MarkdownFormat | MarkdownConfig | None = None
+) -> Path:
     """Read `in_path`, transform its contents, and write to `out_path`.
 
+    Supports registered extensions (e.g. .md, .myst.md, .qmd) and .ipynb. 
+
     If `out_path` is not provided the input file is overwritten.
+    If input is markdown and output is markdown and different formats are specified,
+    it will perform a conversion via a notebook round-trip.
+
     Returns the path written.
     """
-    text = in_path.read_text(encoding="utf-8")
-    new_text = transform_text(text, enabled=enabled)
-    if download_images:
-        target_dir = (out_path or in_path).parent
-        new_text = _download_and_replace_images(new_text, target_dir)
-    if out_path is None:
-        out_path = in_path
-    out_path.write_text(new_text, encoding="utf-8")
-    return out_path
+    in_config = REGISTRY.get(in_format) if in_format is not None else REGISTRY.infer(in_path)
+    
+    # Target path determines out_format if not provided
+    target_path = out_path or in_path
+    out_config = REGISTRY.get(out_format) if out_format is not None else (REGISTRY.infer(target_path) if out_path else in_config)
+
+    if in_path.suffix.lower() == ".ipynb":
+        nb = json.loads(in_path.read_text(encoding="utf-8"))
+        text = notebook_to_md(nb, format=in_config)
+    else:
+        text = in_path.read_text(encoding="utf-8")
+
+    if target_path.suffix.lower() == ".ipynb":
+        nb = md_to_notebook(text, enabled_transforms=in_transforms, format=in_config)
+        target_path.write_text(json.dumps(nb, indent=1), encoding="utf-8")
+    else:
+        # Markdown output
+        is_splitting = False
+        if in_transforms and ("chat_split_m1" in in_transforms or "chat_split_m2" in in_transforms):
+            is_splitting = True
+        elif in_config.chat_split_mode:
+            is_splitting = True
+
+        if in_path.suffix.lower() != ".ipynb" and (in_config.name != out_config.name or is_splitting):
+            # Dialect conversion or Chat Splitting: md -> nb -> md
+            nb = md_to_notebook(text, enabled_transforms=in_transforms, format=in_config)
+            new_text = notebook_to_md(nb, format=out_config)
+        else:
+            # Normal transformation
+            new_text = transform_text(text, enabled=in_transforms, format=in_config)
+
+        # Apply output transforms
+        new_text = transform_text(new_text, enabled=out_transforms, format=out_config)
+
+        if download_images:
+            target_dir = target_path.parent
+            new_text = _download_and_replace_images(new_text, target_dir)
+        target_path.write_text(new_text, encoding="utf-8")
+    return target_path
 
 def _cli() -> None:
-    parser = argparse.ArgumentParser(description="Transform exported Gemini chat markdown to improved markdown.")
-    parser.add_argument("input", type=Path, help="Input markdown file")
-    parser.add_argument("-o", "--output", type=Path, help="Output file (default: overwrite input)")
-    parser.add_argument("--indir", type=Path, help="Input directory to transform all .md files (overrides input file)")
-    parser.add_argument("--outdir", type=Path, help="Output directory for transformed files (required with --indir)")
+    parser = argparse.ArgumentParser(
+        description="Transform and sync Markdown and Jupyter Notebooks with support for MyST, Quarto, and Chat splitting.",
+        epilog="Use --list-transforms to see available text modifications."
+    )
+    parser.add_argument("input", type=Path, nargs="?", help="Input markdown or .ipynb file")
+    parser.add_argument("-o", "--output", type=Path, help="Output file (default: overwrite input, or sync suffix if --sync)")
+    parser.add_argument("--indir", type=Path, help="Batch process a directory (all .md/.ipynb/.qmd)")
+    parser.add_argument("--outdir", type=Path, help="Output directory (required with --indir)")
     parser.add_argument("--list-transforms", action="store_true", help="List available transforms and exit")
-    parser.add_argument("--run-transforms", type=str, help="Comma-separated transforms to run (overrides defaults)")
+    parser.add_argument("--run-transforms", type=str, help="Comma-separated transforms to run (applied to input stage)")
+    parser.add_argument("--in-transforms", type=str, help="Comma-separated transforms for input (overrides --run-transforms)")
+    parser.add_argument("--out-transforms", type=str, help="Comma-separated transforms for output")
+    parser.add_argument("--transform-cell-split", type=str, choices=["m1", "m2"], help="Add chat splitting transform (m1 or m2) to input transforms")
     parser.add_argument("--skip-transforms", type=str, help="Comma-separated transforms to skip")
     parser.add_argument("--download-images", action="store_true", help="Download remote images referenced as 'Image of' and replace with local files")
+    parser.add_argument("--sync", action="store_true", help="Two-way sync: create .ipynb from .md or vice-versa")
+    parser.add_argument("--format", type=str, help="Markdown format for both input and output (e.g. myst, qmd, standard, ipynb)")
+    parser.add_argument("--in-format", type=str, help="Markdown format for input (overrides --format)")
+    parser.add_argument("--out-format", type=str, help="Markdown format for output (overrides --format)")
+    parser.add_argument("--guess-format", action="store_true", help="Print the detected format for the input file and exit")
     args = parser.parse_args()
 
+    if args.guess_format:
+        if not args.input:
+            parser.error("input file is required for --guess-format")
+        print(infer_format(args.input).name)
+        return
+
+    fmt_in = args.in_format or args.format
+    fmt_outs = []
+    if args.out_format:
+        fmt_outs = [f.strip() for f in args.out_format.split(",") if f.strip()]
+    elif args.format:
+        fmt_outs = [args.format]
+
+    # Validate formats (allowing 'ipynb' as a special pseudo-format for file-type conversion)
+    valid = set(REGISTRY.format_names) | {"ipynb"}
+    if fmt_in and fmt_in not in valid:
+        parser.error(f"invalid in-format: '{fmt_in}' (choose from {', '.join(sorted(REGISTRY.format_names))}, ipynb)")
+    
+    for f in fmt_outs:
+        if f not in valid:
+            parser.error(f"invalid out-format: '{f}' (choose from {', '.join(sorted(REGISTRY.format_names))}, ipynb)")
+
     available = {
-        "code_snippet": "Convert 'Code snippet' lines into fences (default on)",
+        "code_snippet": "Convert 'Code snippet' lines into fences (default on for chatexport_abc1)",
         "close_fences": "Auto-close fences started by transforms and unclosed triple-backticks (default on)",
         "collapse_blanks": "Collapse long blank runs to two blank lines (default on)",
+        "chat_cleanup": "Remove 'Show thinking' and 'Export to sheets' boilerplate (default on)",
+        "chat_headings": "Add markdown headings before each chat turn",
+        "generate_toc": "Generate a static Table of Contents under a '## Contents' heading",
+        "chat_split_m1": "Split chat into markdown cells per turn",
+        "chat_split_m2": "Split chat into code cells with promptstr() and markdown outputs",
     }
 
     if args.list_transforms:
@@ -216,14 +945,29 @@ def _cli() -> None:
             print(f"- {k}: {v}")
         return
 
-    # build enabled set
-    if args.run_transforms:
-        enabled = [t.strip() for t in args.run_transforms.split(",") if t.strip()]
+    if not args.input and not args.indir:
+        parser.error("input file or --indir is required")
+
+    # build transform sets
+    raw_in = args.in_transforms or args.run_transforms
+    if raw_in:
+        in_enabled = [t.strip() for t in raw_in.split(",") if t.strip()]
     else:
-        enabled = list(DEFAULT_TRANSFORMS)
+        in_enabled = list(DEFAULT_TRANSFORMS)
         if args.skip_transforms:
             skip = {t.strip() for t in args.skip_transforms.split(",") if t.strip()}
-            enabled = [t for t in enabled if t not in skip]
+            in_enabled = [t for t in in_enabled if t not in skip]
+
+    if args.transform_cell_split:
+        tsplit = f"chat_split_{args.transform_cell_split}"
+        if tsplit not in in_enabled:
+            in_enabled.append(tsplit)
+
+    if args.out_transforms:
+        out_enabled = [t.strip() for t in args.out_transforms.split(",") if t.strip()]
+    else:
+        out_enabled = None
+    
     if args.indir:
         if not args.outdir:
             parser.error("--outdir is required when --indir is used")
@@ -231,18 +975,83 @@ def _cli() -> None:
         out_dir: Path = args.outdir
         out_dir.mkdir(parents=True, exist_ok=True)
         written = []
-        for p in sorted(in_dir.glob("*.md")):
-            target = out_dir / p.name
-            transform_file(p, target, enabled=enabled, download_images=args.download_images)
-            written.append(str(target))
+        files = sorted(list(in_dir.glob("*.md")) + list(in_dir.glob("*.ipynb")) + list(in_dir.glob("*.qmd")))
+        for p in files:
+            for f_out in (fmt_outs or [None]):
+                target = out_dir / p.name
+                if f_out == "ipynb":
+                    target = target.with_suffix(".ipynb")
+                elif f_out:
+                    cfg = REGISTRY.get(f_out)
+                    ext = cfg.extensions[0] if cfg.extensions else ".md"
+                    if len(fmt_outs) > 1:
+                        if not ext.startswith(f".{f_out}"):
+                            target = target.with_suffix(f".{f_out}{ext}")
+                        else:
+                            target = target.with_suffix(ext)
+                    else:
+                        target = target.with_suffix(ext)
+                elif args.sync:
+                    if p.suffix.lower() == ".ipynb":
+                        target = target.with_suffix(".md")
+                    else:
+                        target = target.with_suffix(".ipynb")
+                
+                actual_f_out = "standard" if f_out == "ipynb" else f_out
+                transform_file(p, target, in_transforms=in_enabled, out_transforms=out_enabled, download_images=args.download_images, in_format=fmt_in, out_format=actual_f_out)
+                written.append(str(target))
         print("Wrote:")
         for w in written:
             print(w)
     else:
-        output = transform_file(args.input, args.output, enabled=enabled, download_images=args.download_images)
-        print(f"Wrote: {output}")
+        inp = args.input
+        out_base = args.output
+        written = []
+
+        for f_out in (fmt_outs or [None]):
+            out = out_base
+            if f_out == "ipynb":
+                if not out:
+                    out = inp.with_suffix(".ipynb")
+                elif out.suffix.lower() != ".ipynb":
+                    # If user provided -o out.md but f_out is ipynb, override or append?
+                    # Let's override suffix if it's explicitly requested as ipynb
+                    out = out.with_suffix(".ipynb")
+            elif f_out:
+                cfg = REGISTRY.get(f_out)
+                ext = cfg.extensions[0] if cfg.extensions else ".md"
+                if not out:
+                    if len(fmt_outs) > 1:
+                        if not ext.startswith(f".{f_out}"):
+                            out = inp.with_suffix(f".{f_out}{ext}")
+                        else:
+                            out = inp.with_suffix(ext)
+                    else:
+                        out = inp.with_suffix(ext)
+                elif out_base and len(fmt_outs) > 1:
+                    # Use stem to avoid double extension if possible
+                    if not ext.startswith(f".{f_out}"):
+                        out = out_base.parent / f"{out_base.stem}.{f_out}{ext}"
+                    else:
+                        out = out_base.parent / f"{out_base.stem}{ext}"
+            elif args.sync and not out:
+                if inp.suffix.lower() == ".ipynb":
+                    out = inp.with_suffix(".md")
+                else:
+                    out = inp.with_suffix(".ipynb")
+
+            actual_f_out = "standard" if f_out == "ipynb" else f_out
+            output = transform_file(inp, out, in_transforms=in_enabled, out_transforms=out_enabled, download_images=args.download_images, in_format=fmt_in, out_format=actual_f_out)
+            written.append(str(output))
+        
+        if len(written) > 1:
+            print("Wrote:")
+            for w in written:
+                print(w)
+        elif written:
+            print(f"Wrote: {written[0]}")
 
 
 if __name__ == "__main__":
-    _cli()
+    _cli()  # pragma: no cover
 
