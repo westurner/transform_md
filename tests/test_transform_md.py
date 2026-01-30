@@ -295,6 +295,164 @@ Good.
     assert found_back, f"Metadata lost in round-trip for {mode}/{format}"
 
 
+def test_mixed_headings_and_toc():
+    scripts_dir = Path(__file__).resolve().parent
+    mod = load_transform_module(scripts_dir)
+    
+    text = """# Main Topic
+
+## Intro
+Standard intro.
+
+You asked:
+---------
+Question 1?
+
+Gemini Replied:
+--------------
+Answer 1.
+
+### Technical Details
+- Part A
+- Part B
+
+You asked:
+---------
+Question 2?
+"""
+    # Test m1 mode
+    nb = mod.md_to_notebook(text, format="chatexport_abc1", enabled_transforms=["chat_split_m1", "generate_toc", "chat_headings"])
+    
+    # Check TOC of the first cell (which should contain the preamble)
+    preamble = "".join(nb['cells'][0]['source'])
+    assert "## Contents" in preamble
+    assert "* [Main Topic](#main-topic)" in preamble
+    assert "* [Intro](#intro)" in preamble
+    assert "* [Technical Details](#technical-details)" in preamble
+    
+    # Crucially: Prompt/Response headings SHOULD be in TOC now (user preference)
+    toc_lines = [l for l in preamble.splitlines() if "* [" in l]
+    assert any("Prompt: 1" in l for l in toc_lines)
+    assert any("Response: 1" in l for l in toc_lines)
+    assert any("Prompt: 2" in l for l in toc_lines)
+    
+    # Check cells
+    # Indices:
+    # 0: Preamble (Title, TOC, Intro)
+    # 1: # Prompt: 1
+    # 2: Question 1?
+    # 3: # Response: 1
+    # 4: Answer 1 + Technical Details
+    # 5: # Prompt: 2
+    # 6: Question 2?
+    
+    assert len(nb['cells']) == 7
+    assert "# Prompt: 1" in "".join(nb['cells'][1]['source'])
+    assert "# Response: 1" in "".join(nb['cells'][3]['source'])
+    assert "### Technical Details" in "".join(nb['cells'][4]['source'])
+    assert "# Prompt: 2" in "".join(nb['cells'][5]['source'])
+
+def test_toc_indentation_normalization():
+    scripts_dir = Path(__file__).resolve().parent
+    mod = load_transform_module(scripts_dir)
+    
+    # Text starting with H2
+    text = """## Section 1
+### Part A
+## Section 2
+"""
+    out = mod.transform_text(text, enabled=["generate_toc"])
+    lines = [l for l in out.splitlines() if "* [" in l]
+    # min level is 2. 
+    # H2: 2 - 2 = 0 indent
+    # H3: 3 - 2 = 1 indent (2 spaces)
+    assert lines[0] == "* [Section 1](#section-1)"
+    assert lines[1] == "  * [Part A](#part-a)"
+    assert lines[2] == "* [Section 2](#section-2)"
+
+def test_add_title_transform():
+    scripts_dir = Path(__file__).resolve().parent
+    mod = load_transform_module(scripts_dir)
+    
+    text = "Some content"
+    out = mod.transform_text(text, enabled=["add_title"], doc_title="My Title")
+    assert out.startswith("# My Title\n\nSome content")
+    
+    # test deduplication
+    text2 = "# My Title\n\nAlready has it"
+    out2 = mod.transform_text(text2, enabled=["add_title"], doc_title="My Title")
+    assert out2 == text2
+
+def test_transform_file_add_title(tmp_path: Path):
+    scripts_dir = Path(__file__).resolve().parent
+    mod = load_transform_module(scripts_dir)
+    
+    inp = tmp_path / "Document Name.md"
+    inp.write_text("content")
+    
+    # Test default (add_title is in DEFAULT_TRANSFORMS)
+    written = mod.transform_file(inp)
+    got = written.read_text()
+    # Expect title AND TOC by default (TOC follows title)
+    assert got.startswith("# Document Name\n\n## Contents\n\n* [Document Name](#document-name)\n\ncontent")
+
+    # Test explicitly disabled
+    inp2 = tmp_path / "Other.md"
+    inp2.write_text("content")
+    written2 = mod.transform_file(inp2, in_transforms=[])
+    got2 = written2.read_text()
+    assert got2 == "content"
+
+def test_json_ingestion_and_splitting(tmp_path: Path):
+    scripts_dir = Path(__file__).resolve().parent
+    mod = load_transform_module(scripts_dir)
+    
+    # Gemini JSON
+    gem_file = tmp_path / "gemini.json"
+    gem_data = {
+        "messages": [
+            {"author": "user", "content": "Q1"},
+            {"author": "ai", "content": "A1"}
+        ]
+    }
+    gem_file.write_text(json.dumps(gem_data))
+    
+    # Transform to nb with m1 split
+    nb_file = tmp_path / "out.ipynb"
+    mod.transform_file(gem_file, nb_file, in_transforms=["chat_split_m1"])
+    
+    nb = json.loads(nb_file.read_text())
+    # Should have 4 cells: P1, Q1, R1, A1 (preamble is empty but might stay)
+    # Filter out empty cells
+    cells = [c for c in nb['cells'] if "".join(c['source']).strip()]
+    
+    assert any("# Prompt: 1" in "".join(c['source']) for c in cells)
+    assert any("Q1" in "".join(c['source']) for c in cells)
+    assert any("# Response: 2" in "".join(c['source']) for c in cells) # Gemini uses msg index
+    assert any("A1" in "".join(c['source']) for c in cells)
+
+    # Copilot JSON
+    cop_file = tmp_path / "test.copilot.json"
+    cop_data = {
+        "requests": [
+            {
+                "message": {"text": "Copilot Q"},
+                "response": [{"kind": "markdown", "value": "Copilot A"}]
+            }
+        ]
+    }
+    cop_file.write_text(json.dumps(cop_data))
+    
+    nb_file_cop = tmp_path / "cop.ipynb"
+    mod.transform_file(cop_file, nb_file_cop, in_transforms=["chat_split_m1"])
+    
+    nb_cop = json.loads(nb_file_cop.read_text())
+    cells_cop = [c for c in nb_cop['cells'] if "".join(c['source']).strip()]
+    assert any("# Prompt: 1" in "".join(c['source']) for c in cells_cop)
+    assert any("Copilot Q" in "".join(c['source']) for c in cells_cop)
+    assert any("# Response: 1" in "".join(c['source']) for c in cells_cop)
+    assert any("Copilot A" in "".join(c['source']) for c in cells_cop)
+
 def test_download_images_failure(tmp_path: Path):
     scripts_dir = Path(__file__).resolve().parent
     mod = load_transform_module(scripts_dir)
@@ -630,7 +788,10 @@ def test_cli_basic(tmp_path: Path, capsys):
     with patch("sys.argv", ["transform_md.py", str(test_md)]):
         mod._cli()
     
-    assert "Wrote:" in capsys.readouterr().out
+    # capturing logger.info which goes to sys.stdout
+    captured = capsys.readouterr().out
+    assert "Transforming:" in captured
+    assert "cli.md" in captured
     assert "```mermaid" in test_md.read_text()
 
 
@@ -953,23 +1114,26 @@ def test_cli_transform_cell_split(tmp_path: Path):
     
     # Test --transform-cell-split=m1
     out_ipynb = tmp_path / "split_test.ipynb"
-    with patch("sys.argv", ["transform_md.py", str(test_md), "-o", str(out_ipynb), "--transform-cell-split", "m1"]):
+    # Skip generate_toc to keep the cell count predictable for this logic test
+    with patch("sys.argv", ["transform_md.py", str(test_md), "-o", str(out_ipynb), "--transform-cell-split", "m1", "--skip-transforms", "generate_toc"]):
         mod._cli()
     
     assert out_ipynb.exists()
     nb = json.loads(out_ipynb.read_text())
-    # Now splits into 4 cells because headings get their own cells
-    assert len(nb['cells']) == 4
-    assert "# Prompt: 1" in "".join(nb['cells'][0]['source'])
-    assert "Hello" in "".join(nb['cells'][1]['source'])
-    assert "# Response: 1" in "".join(nb['cells'][2]['source'])
-    assert "Hi" in "".join(nb['cells'][3]['source'])
+    # Now splits into 5 cells because the title heading is added by default, 
+    # plus 4 cells for Prompt/Response headings and content.
+    assert len(nb['cells']) == 5
+    assert "# split_test" in "".join(nb['cells'][0]['source'])
+    assert "# Prompt: 1" in "".join(nb['cells'][1]['source'])
+    assert "Hello" in "".join(nb['cells'][2]['source'])
+    assert "# Response: 1" in "".join(nb['cells'][3]['source'])
+    assert "Hi" in "".join(nb['cells'][4]['source'])
 
     # Test that it ADDS to defaults (e.g. code_snippet is still there)
     test_md_2 = tmp_path / "split_test_2.md"
     test_md_2.write_text("Code snippet\n\nYou asked:\n----------\nHello\n")
     out_ipynb_2 = tmp_path / "split_test_2.ipynb"
-    with patch("sys.argv", ["transform_md.py", str(test_md_2), "-o", str(out_ipynb_2), "--transform-cell-split", "m1"]):
+    with patch("sys.argv", ["transform_md.py", str(test_md_2), "-o", str(out_ipynb_2), "--transform-cell-split", "m1", "--skip-transforms", "generate_toc"]):
         mod._cli()
     
     nb2 = json.loads(out_ipynb_2.read_text())

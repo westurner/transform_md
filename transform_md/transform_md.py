@@ -14,6 +14,8 @@ import hashlib
 import mimetypes
 import urllib.request
 import urllib.parse
+import logging
+import sys
 from enum import Enum
 from pathlib import Path
 from typing import Iterable
@@ -22,6 +24,40 @@ try:
     import yaml
 except ImportError:
     yaml = None
+
+logger = logging.getLogger("transform_md")
+
+
+class ColorFormatter(logging.Formatter):
+    """Formatter that adds ANSI red color to error and critical messages."""
+    RED = "\033[31m"
+    RESET = "\033[0m"
+
+    def format(self, record):
+        message = super().format(record)
+        if record.levelno >= logging.ERROR:
+            return f"{self.RED}{message}{self.RESET}"
+        return message
+
+
+def setup_logging(log_file: Path | str | None = "transform.log", verbose: bool = False) -> None:
+    """Configure logging to stdout (with color) and a file."""
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    
+    # Clear existing handlers to avoid duplicates or stale streams in tests
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+
+    # Stdout handler
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(ColorFormatter("%(levelname)s: %(message)s"))
+    logger.addHandler(stdout_handler)
+
+    # File handler
+    if log_file:
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+        logger.addHandler(file_handler)
 
 
 class MarkdownConfig:
@@ -113,7 +149,7 @@ REGISTRY.register(MarkdownConfig(
     name="chatexport_abc1",
     extensions=[".md"],
     default_transforms=[
-        "chat_cleanup", "chat_headings", "code_snippet", "close_fences", "collapse_blanks", "generate_toc", "chat_input_metadata", "chat_hide_thoughts"
+        "add_title", "chat_headings", "code_snippet", "close_fences", "collapse_blanks", "generate_toc", "chat_input_metadata", "chat_hide_thoughts", "chat_cleanup", 
     ],
     chat_prompt_re=r"(?i)^You asked:?\s*\n[-=]+\s*$",
     chat_response_re=r"(?i)^(?:---\n)?Gemini Replied:?\s*\n[-=]+\s*$"
@@ -121,29 +157,40 @@ REGISTRY.register(MarkdownConfig(
 REGISTRY.register(MarkdownConfig(
     name="myst",
     extensions=[".myst.md"],
+    default_transforms=["add_title"],
     cell_fence_template="```{{code-cell}} {lang}"
 ))
 REGISTRY.register(MarkdownConfig(
     name="qmd",
     extensions=[".qmd"],
+    default_transforms=["add_title"],
     cell_fence_template="```{{{lang}}}",
     cell_metadata_style="quarto"
 ))
 REGISTRY.register(MarkdownConfig(
+    name="copilot",
+    extensions=[".copilot.json"],
+    default_transforms=[
+        "add_title", "chat_cleanup", "chat_headings", "code_snippet", "close_fences", "collapse_blanks", "generate_toc", "chat_input_metadata", "chat_hide_thoughts"
+    ]
+))
+REGISTRY.register(MarkdownConfig(
     name="standard",
+    default_transforms=["add_title"],
     extensions=[]
 ))
 
 
 DEFAULT_TRANSFORMS = [
+    "add_title",
+    "chat_input_metadata",
+    "chat_headings",
+    "generate_toc",
     "code_snippet",
     "close_fences",
     "collapse_blanks",
-    "chat_cleanup",
-    "chat_headings",
-    "generate_toc",
-    "chat_input_metadata",
     "chat_hide_thoughts",
+    "chat_cleanup",
 ]
 
 
@@ -157,7 +204,7 @@ def _slugify(text: str) -> str:
     return text
 
 
-def transform_text(text: str, enabled: Iterable[str] | None = None, format: str | MarkdownFormat | MarkdownConfig = "chatexport_abc1") -> str:
+def transform_text(text: str, enabled: Iterable[str] | None = None, format: str | MarkdownFormat | MarkdownConfig = "chatexport_abc1", doc_title: str | None = None) -> str:
     """Transform the input markdown text.
 
     If format is CHATEXPORT_ABC1 (Gemini):
@@ -192,6 +239,11 @@ def transform_text(text: str, enabled: Iterable[str] | None = None, format: str 
     skip_lines = 0
 
     lines = text.splitlines()
+    
+    # Prepend title if requested and not already present as first heading
+    # We'll do this later to handle frontmatter correctly
+    added_title = False
+
     for i, line in enumerate(lines):
         if skip_lines > 0:
             skip_lines -= 1
@@ -283,7 +335,34 @@ def transform_text(text: str, enabled: Iterable[str] | None = None, format: str 
             out_lines.append('```')
             generic_fence_open = False
 
-    # TOC transform: generate from final out_lines
+    # Post-processing: Add title and TOC
+    insert_pos = 0
+    if out_lines and out_lines[0].startswith("---"):
+        try:
+            # simplistic toggle check for second ---
+            for idx in range(1, len(out_lines)):
+                if out_lines[idx].startswith("---"):
+                    insert_pos = idx + 1
+                    break
+        except Exception:
+            pass
+
+    # 1. Add Title
+    if doc_title and config.is_transform_enabled('add_title', explicitly_enabled=enabled):
+        title_heading = f"# {doc_title}"
+        # Check if already present at the top (after frontmatter)
+        already_has_title = False
+        for idx in range(insert_pos, min(insert_pos + 3, len(out_lines))):
+            if out_lines[idx].strip() == title_heading:
+                already_has_title = True
+                break
+        
+        if not already_has_title:
+            title_lines = [title_heading, ""]
+            out_lines = out_lines[:insert_pos] + title_lines + out_lines[insert_pos:]
+            insert_pos += 2
+
+    # 2. Add TOC
     if config.is_transform_enabled('generate_toc', explicitly_enabled=enabled):
         # Skip if already exists
         if not any(re.match(r"^##\s+Contents\s*$", l, re.I) for l in out_lines):
@@ -292,8 +371,7 @@ def transform_text(text: str, enabled: Iterable[str] | None = None, format: str 
             while i < len(out_lines):
                 line = out_lines[i]
                 
-                # Skip if it matches a chat delimiter (they will be removed during splitting)
-                # We check the raw line content for speed first
+                # Skip if it matches a chat delimiter
                 line_stripped = line.strip()
                 if line_stripped.lower().startswith(("you asked", "gemini replied")):
                     remaining = "\n".join(out_lines[i:])
@@ -309,13 +387,11 @@ def transform_text(text: str, enabled: Iterable[str] | None = None, format: str 
                 if m_atx:
                     level = len(m_atx.group(1))
                     title = m_atx.group(2).strip()
-                    is_chat_h = re.match(r"^(Prompt|Response):\s+\d+$", title, re.I)
-                    if title.lower() != "contents" and not is_chat_h:
+                    if title.lower() != "contents":
                         toc_entries.append((level, title))
                 # Setext: Line\n=== or Line\n---
                 elif i + 1 < len(out_lines):
                     next_line = out_lines[i+1].strip()
-                    # A setext heading line itself shouldn't be too long or empty
                     if line_stripped and next_line and len(next_line) >= 3 and all(c == next_line[0] for c in next_line) and next_line[0] in '=-':
                         title = line_stripped
                         level = 1 if next_line[0] == '=' else 2
@@ -324,31 +400,24 @@ def transform_text(text: str, enabled: Iterable[str] | None = None, format: str 
                 i += 1
             
             if toc_entries:
+                min_lvl = min(lvl for lvl, _ in toc_entries)
                 toc_lines = ["## Contents", ""]
                 for level, title in toc_entries:
                     slug = _slugify(title)
-                    indent = "  " * (level - 1)
+                    indent = "  " * (level - min_lvl)
                     toc_lines.append(f"{indent}* [{title}](#{slug})")
                 toc_lines.append("")
                 
-                # Insert at the top (after frontmatter if present)
-                insert_pos = 0
-                if out_lines and out_lines[0].startswith("---"):
-                    try:
-                        # simplistic toggle check for second ---
-                        for idx in range(1, len(out_lines)):
-                            if out_lines[idx].startswith("---"):
-                                insert_pos = idx + 1
-                                break
-                    except Exception:
-                        pass
-                
                 final_toc = []
-                if insert_pos > 0:
+                if insert_pos > 0 and out_lines[insert_pos - 1].strip():
                     final_toc.append("")
                 final_toc.extend(toc_lines)
 
                 out_lines = out_lines[:insert_pos] + final_toc + out_lines[insert_pos:]
+
+    if text.endswith('\n'):
+        return '\n'.join(out_lines) + '\n'
+    return '\n'.join(out_lines)
 
     if text.endswith('\n'):
         return '\n'.join(out_lines) + '\n'
@@ -391,21 +460,23 @@ def _md_to_notebook_chat(text: str, config: MarkdownConfig, mode: str, metadata:
     """Specialized notebook converter for chat turn splitting (m1, m2)."""
     segments = _get_chat_segments(text, config.chat_prompt_re, config.chat_response_re)
     
-    # If chat_headings is enabled, split segments further to ensure each heading is its own cell
-    if config.is_transform_enabled('chat_headings', explicitly_enabled=enabled):
-        h_segments = []
-        for seg in segments:
-            # Split content by chat headings, keeping the headings in the result
-            parts = re.split(r"(^# (?:Prompt|Response): \d+\s*$)", seg['content'], flags=re.MULTILINE)
-            for p in parts:
-                if not p.strip('\r\n'):
-                    continue
-                is_h = re.match(r"^# (?:Prompt|Response): \d+\s*$", p.strip())
-                h_segments.append({
-                    'type': 'heading' if is_h else seg['type'],
-                    'content': p.strip('\r\n')
-                })
-        segments = h_segments
+    # Always split by structural headings if we are in a chat-splitting mode.
+    # We do this even if 'chat_headings' isn't explicitly enabled because the headings
+    # might have been added by a previous transformation or be present in the source.
+    h_segments = []
+    for seg in segments:
+        # Split content by chat headings, keeping the headings in the result
+        # Note: We use capturing group to keep the delimiter
+        parts = re.split(r"(^# (?:Prompt|Response): \d+\s*$)", seg['content'], flags=re.MULTILINE)
+        for p in parts:
+            if not p.strip('\r\n'):
+                continue
+            is_h = re.match(r"^# (?:Prompt|Response): \d+\s*$", p.strip())
+            h_segments.append({
+                'type': 'heading' if is_h else seg['type'],
+                'content': p.strip('\r\n')
+            })
+    segments = h_segments
 
     # If chat_hide_thoughts is enabled, split out thoughts from response segments
     if config.is_transform_enabled('chat_hide_thoughts', explicitly_enabled=enabled):
@@ -542,7 +613,7 @@ def _md_to_notebook_chat(text: str, config: MarkdownConfig, mode: str, metadata:
     }
 
 
-def md_to_notebook(text: str, enabled_transforms: Iterable[str] | None = None, format: str | MarkdownFormat | MarkdownConfig = "standard") -> dict:
+def md_to_notebook(text: str, enabled_transforms: Iterable[str] | None = None, format: str | MarkdownFormat | MarkdownConfig = "standard", doc_title: str | None = None) -> dict:
     """Convert markdown text to an .ipynb-compatible dictionary.
 
     Runs transform_text first.
@@ -551,7 +622,7 @@ def md_to_notebook(text: str, enabled_transforms: Iterable[str] | None = None, f
     """
     config = REGISTRY.get(format)
 
-    cleaned = transform_text(text, enabled=enabled_transforms, format=config)
+    cleaned = transform_text(text, enabled=enabled_transforms, format=config, doc_title=doc_title)
 
     metadata = {}
     content = cleaned
@@ -843,20 +914,80 @@ def transform_file(
 
     Returns the path written.
     """
-    in_config = REGISTRY.get(in_format) if in_format is not None else REGISTRY.infer(in_path)
-    
     # Target path determines out_format if not provided
     target_path = out_path or in_path
+    
+    # Try to detect Gemini/Copilot JSON formats early to use better default configs
+    if in_format is None:
+        if in_path.suffix.lower() == ".json" and not in_path.name.lower().endswith(".copilot.json"):
+            # Peek to see if it's Gemini
+            try:
+                data = json.loads(in_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and "messages" in data:
+                    in_format = "chatexport_abc1"
+            except:
+                pass
+        elif in_path.name.lower().endswith(".copilot.json"):
+            in_format = "copilot"
+
+    in_config = REGISTRY.get(in_format) if in_format is not None else REGISTRY.infer(in_path)
     out_config = REGISTRY.get(out_format) if out_format is not None else (REGISTRY.infer(target_path) if out_path else in_config)
 
     if in_path.suffix.lower() == ".ipynb":
         nb = json.loads(in_path.read_text(encoding="utf-8"))
         text = notebook_to_md(nb, format=in_config)
+    elif in_config.name == "copilot" or in_path.name.lower().endswith(".copilot.json"):
+        # Handle Copilot export JSON
+        try:
+            data = json.loads(in_path.read_text(encoding="utf-8"))
+            text = ""
+            for i, req in enumerate(data.get("requests", [])):
+                prompt = req.get("message", {}).get("text", "")
+                text += f"# Prompt: {i+1}\n\n{prompt}\n\n"
+                
+                response_text = ""
+                for part in req.get("response", []):
+                    if part.get("kind") == "markdown":
+                        response_text += part.get("value", "") + "\n"
+                    elif part.get("kind") == "textEditGroup" and "edits" in part:
+                        # Extract text from edits
+                        for edit_group in part["edits"]:
+                            for edit in edit_group:
+                                response_text += edit.get("text", "")
+                        response_text += "\n"
+                
+                if response_text:
+                    text += f"# Response: {i+1}\n\n{response_text}\n\n"
+            
+            if not text:
+                text = in_path.read_text(encoding="utf-8")
+        except:
+            text = in_path.read_text(encoding="utf-8")
+    elif in_path.suffix.lower() == ".json":
+        # Handle Gemini export JSON
+        try:
+            data = json.loads(in_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and "messages" in data:
+                text = ""
+                for i, msg in enumerate(data["messages"]):
+                    raw_author = msg.get("author", "unknown").lower()
+                    if raw_author == "ai":
+                        author = "Response"
+                    elif raw_author == "user":
+                        author = "Prompt"
+                    else:
+                        author = raw_author.capitalize()
+                    text += f"# {author}: {i+1}\n\n"
+                    text += msg.get("content", "") + "\n\n"
+            else:
+                text = in_path.read_text(encoding="utf-8")
+        except:
+            text = in_path.read_text(encoding="utf-8")
     else:
         text = in_path.read_text(encoding="utf-8")
 
     if target_path.suffix.lower() == ".ipynb":
-        nb = md_to_notebook(text, enabled_transforms=in_transforms, format=in_config)
+        nb = md_to_notebook(text, enabled_transforms=in_transforms, format=in_config, doc_title=in_path.stem)
         target_path.write_text(json.dumps(nb, indent=1), encoding="utf-8")
     else:
         # Markdown output
@@ -868,11 +999,11 @@ def transform_file(
 
         if in_path.suffix.lower() != ".ipynb" and (in_config.name != out_config.name or is_splitting):
             # Dialect conversion or Chat Splitting: md -> nb -> md
-            nb = md_to_notebook(text, enabled_transforms=in_transforms, format=in_config)
+            nb = md_to_notebook(text, enabled_transforms=in_transforms, format=in_config, doc_title=in_path.stem)
             new_text = notebook_to_md(nb, format=out_config)
         else:
             # Normal transformation
-            new_text = transform_text(text, enabled=in_transforms, format=in_config)
+            new_text = transform_text(text, enabled=in_transforms, format=in_config, doc_title=in_path.stem)
 
         # Apply output transforms
         new_text = transform_text(new_text, enabled=out_transforms, format=out_config)
@@ -886,7 +1017,8 @@ def transform_file(
 def _cli() -> None:
     parser = argparse.ArgumentParser(
         description="Transform and sync Markdown and Jupyter Notebooks with support for MyST, Quarto, and Chat splitting.",
-        epilog="Use --list-transforms to see available text modifications."
+        epilog="Use --list-transforms to see available text modifications.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("input", type=Path, nargs="?", help="Input markdown or .ipynb file")
     parser.add_argument("-o", "--output", type=Path, help="Output file (default: overwrite input, or sync suffix if --sync)")
@@ -904,7 +1036,11 @@ def _cli() -> None:
     parser.add_argument("--in-format", type=str, help="Markdown format for input (overrides --format)")
     parser.add_argument("--out-format", type=str, help="Markdown format for output (overrides --format)")
     parser.add_argument("--guess-format", action="store_true", help="Print the detected format for the input file and exit")
+    parser.add_argument("--log-file", type=Path, default=Path("transform.log"), help="Path to log file")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose (DEBUG) logging")
     args = parser.parse_args()
+
+    setup_logging(log_file=args.log_file, verbose=args.verbose)
 
     if args.guess_format:
         if not args.input:
@@ -929,6 +1065,7 @@ def _cli() -> None:
             parser.error(f"invalid out-format: '{f}' (choose from {', '.join(sorted(REGISTRY.format_names))}, ipynb)")
 
     available = {
+        "add_title": "Add the filename as a # {title} heading",
         "code_snippet": "Convert 'Code snippet' lines into fences (default on for chatexport_abc1)",
         "close_fences": "Auto-close fences started by transforms and unclosed triple-backticks (default on)",
         "collapse_blanks": "Collapse long blank runs to two blank lines (default on)",
@@ -998,11 +1135,12 @@ def _cli() -> None:
                         target = target.with_suffix(".ipynb")
                 
                 actual_f_out = "standard" if f_out == "ipynb" else f_out
+                logger.info("Transforming: %r -> %r", p.name, target.name)  # TODO: escape or print tuple
                 transform_file(p, target, in_transforms=in_enabled, out_transforms=out_enabled, download_images=args.download_images, in_format=fmt_in, out_format=actual_f_out)
                 written.append(str(target))
-        print("Wrote:")
-        for w in written:
-            print(w)
+        # Final summary
+        if len(written) > 0:
+            logger.info("Successfully wrote %d files.", len(written))
     else:
         inp = args.input
         out_base = args.output
@@ -1041,15 +1179,16 @@ def _cli() -> None:
                     out = inp.with_suffix(".ipynb")
 
             actual_f_out = "standard" if f_out == "ipynb" else f_out
+            target_name = (out or inp).name
+            logger.info("Transforming: %s -> %s", inp.name, target_name)
             output = transform_file(inp, out, in_transforms=in_enabled, out_transforms=out_enabled, download_images=args.download_images, in_format=fmt_in, out_format=actual_f_out)
             written.append(str(output))
         
         if len(written) > 1:
-            print("Wrote:")
-            for w in written:
-                print(w)
+            logger.info("Successfully wrote %d files.", len(written))
         elif written:
-            print(f"Wrote: {written[0]}")
+            # We already logged Transforming... above
+            pass
 
 
 if __name__ == "__main__":
