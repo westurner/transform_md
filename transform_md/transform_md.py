@@ -174,8 +174,15 @@ REGISTRY.register(
             "chat_hide_thoughts",
             "chat_cleanup",
         ],
-        chat_prompt_re=r"(?i)^You asked:?\s*\n[-=]+\s*$",
-        chat_response_re=r"(?i)^(?:---\n)?Gemini Replied:?\s*\n[-=]+\s*$",
+        chat_prompt_re=(
+            r"(?im)^[ \t]*(?:#\s*)?You asked:?"
+            r"[ \t]*(?:\n[ \t]*[-=]{3,}[ \t]*)?$"
+        ),
+        chat_response_re=(
+            r"(?im)^(?:---[ \t]*\n)?[ \t]*(?:#\s*)?"
+            r"(?:Gemini Replied|Gemini Response):?"
+            r"[ \t]*(?:\n[ \t]*[-=]{3,}[ \t]*)?$"
+        ),
     )
 )
 REGISTRY.register(
@@ -301,8 +308,6 @@ def transform_text(
             if prompt_re and (m := prompt_re.match(remaining)):
                 prompt_n += 1
                 match_text = m.group(0)
-                out_lines.extend(match_text.splitlines())
-                out_lines.append("")
                 out_lines.append(f"# Prompt: {prompt_n}")
                 out_lines.append("")
                 skip_lines = match_text.count("\n")
@@ -310,8 +315,6 @@ def transform_text(
             elif response_re and (m := response_re.match(remaining)):
                 response_n += 1
                 match_text = m.group(0)
-                out_lines.extend(match_text.splitlines())
-                out_lines.append("")
                 out_lines.append(f"# Response: {response_n}")
                 out_lines.append("")
                 skip_lines = match_text.count("\n")
@@ -544,6 +547,7 @@ def _md_to_notebook_chat(
     # might have been added by a previous transformation or be present in the source.
     h_segments = []
     for seg in segments:
+        section_type = seg["type"]
         # Split content by chat headings, keeping the headings in the result
         # Note: We use capturing group to keep the delimiter
         parts = re.split(
@@ -553,8 +557,17 @@ def _md_to_notebook_chat(
             if not p.strip("\r\n"):
                 continue
             is_h = re.match(r"^# (?:Prompt|Response): \d+\s*$", p.strip())
+            if is_h:
+                section_type = (
+                    "prompt"
+                    if p.strip().lower().startswith("# prompt:")
+                    else "response"
+                )
             h_segments.append(
-                {"type": "heading" if is_h else seg["type"], "content": p.strip("\r\n")}
+                {
+                    "type": "heading" if is_h else section_type,
+                    "content": p.strip("\r\n"),
+                }
             )
     segments = h_segments
 
@@ -572,7 +585,7 @@ def _md_to_notebook_chat(
                 )
                 for part in sub_parts:
                     if re.match(r"^Show thinking\s*$", part, re.I):
-                        t_segments.append({"type": "thought", "content": part})
+                        continue
                     else:
                         blocks = re.split(r"\n\n+", part)
                         thought_blocks = []
@@ -593,7 +606,7 @@ def _md_to_notebook_chat(
                                 re.I,
                             ):
                                 is_b_thought = True
-                            elif b_check.lower() == "thinking...":
+                            elif b_check.lower() in {"thinking", "thought", "thinking..."}:
                                 is_b_thought = True
 
                             if is_b_thought and in_thoughts:
@@ -776,6 +789,48 @@ def md_to_notebook(
 
     cells = []
 
+    myst_cell_break_re = re.compile(
+        r"^\+\++(?:[ \t]+(?P<metadata>\{.*\}))?[ \t]*$",
+        re.MULTILINE,
+    )
+
+    def append_markdown_cells(markdown_text: str) -> None:
+        """Append MyST markdown cells, including Jupytext metadata breaks."""
+        if config.name != "myst":
+            markdown_parts = [(markdown_text, {})]
+        else:
+            markdown_parts = []
+            last_break = 0
+            pending_metadata = {}
+            for cell_break in myst_cell_break_re.finditer(markdown_text):
+                cell_source = markdown_text[last_break : cell_break.start()].strip()
+                if cell_source:
+                    markdown_parts.append((cell_source, pending_metadata))
+                pending_metadata = {}
+                if cell_break.group("metadata"):
+                    try:
+                        parsed_metadata = json.loads(cell_break.group("metadata"))
+                        if isinstance(parsed_metadata, dict):
+                            pending_metadata = parsed_metadata
+                    except json.JSONDecodeError:
+                        pass
+                last_break = cell_break.end()
+
+            cell_source = markdown_text[last_break:].strip()
+            if cell_source:
+                markdown_parts.append((cell_source, pending_metadata))
+
+        for cell_source, cell_metadata in markdown_parts:
+            if not cell_source:
+                continue
+            cells.append(
+                {
+                    "cell_type": "markdown",
+                    "metadata": cell_metadata,
+                    "source": [line + "\n" for line in cell_source.splitlines()],
+                }
+            )
+
     # Match code fences: ```[ { ]lang[ } ]
     # Also handles MyST {code-cell} format and Quarto {lang}
     fence_re = re.compile(
@@ -787,23 +842,7 @@ def md_to_notebook(
         # markdown before
         md_part = content[last_pos : match.start()].strip()
         if md_part:
-            cell_meta = {}
-            # Check for MyST-style markdown cell metadata
-            inner_fm = re.match(r"^---\s*\n(.*?)\n---\s*\n", md_part, re.DOTALL)
-            if inner_fm and yaml:
-                try:
-                    cell_meta.update(yaml.safe_load(inner_fm.group(1)) or {})
-                    md_part = md_part[inner_fm.end() :]
-                except Exception:
-                    pass
-
-            cells.append(
-                {
-                    "cell_type": "markdown",
-                    "metadata": cell_meta,
-                    "source": [line + "\n" for line in md_part.splitlines()],
-                }
-            )
+            append_markdown_cells(md_part)
 
         lang_input = match.group(1).strip().lower()
         code_content = match.group(2)
@@ -871,22 +910,7 @@ def md_to_notebook(
     # tail
     md_tail = content[last_pos:].strip()
     if md_tail:
-        cell_meta = {}
-        inner_fm = re.match(r"^---\s*\n(.*?)\n---\s*\n", md_tail, re.DOTALL)
-        if inner_fm and yaml:
-            try:
-                cell_meta.update(yaml.safe_load(inner_fm.group(1)) or {})
-                md_tail = md_tail[inner_fm.end() :]
-            except Exception:
-                pass
-
-        cells.append(
-            {
-                "cell_type": "markdown",
-                "metadata": cell_meta,
-                "source": [line + "\n" for line in md_tail.splitlines()],
-            }
-        )
+        append_markdown_cells(md_tail)
 
     return {"cells": cells, "metadata": metadata, "nbformat": 4, "nbformat_minor": 5}
 
@@ -904,6 +928,7 @@ def notebook_to_md(
         lines.append("---")
         lines.append("")
 
+    last_cell_was_markdown = False
     for cell in nb.get("cells", []):
         ctype = cell.get("cell_type", "markdown")
         source = cell.get("source", [])
@@ -915,14 +940,18 @@ def notebook_to_md(
         cmeta = cell.get("metadata", {})
 
         if ctype == "markdown":
-            if cmeta and yaml:
-                # MyST style markdown cell metadata
-                if config.name == "myst" or config.cell_metadata_style == "yaml":
-                    lines.append("---")
-                    lines.append(yaml.dump(cmeta).strip())
-                    lines.append("---")
+            if config.name == "myst" and (cmeta or last_cell_was_markdown):
+                # Jupytext uses +++ to preserve markdown cell boundaries and metadata.
+                lines.append(
+                    f"+++ {json.dumps(cmeta)}" if cmeta else "+++"
+                )
+            elif cmeta and yaml and config.cell_metadata_style == "yaml":
+                lines.append("---")
+                lines.append(yaml.dump(cmeta).strip())
+                lines.append("---")
             lines.append(source_text.strip())
             lines.append("")
+            last_cell_was_markdown = True
         else:
             # code cell
             lang = cmeta.get("language")
@@ -949,6 +978,7 @@ def notebook_to_md(
             lines.append(source_text.rstrip())
             lines.append("```")
             lines.append("")
+            last_cell_was_markdown = False
 
     return "\n".join(lines).strip() + "\n"
 

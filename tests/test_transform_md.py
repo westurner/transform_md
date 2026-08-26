@@ -142,6 +142,42 @@ print("myst")
     assert "id: myst-cell" in back
 
 
+def test_myst_markdown_cell_metadata_uses_jupytext_blocks():
+    scripts_dir = Path(__file__).resolve().parent
+    mod = load_transform_module(scripts_dir)
+    nb = {
+        "metadata": {},
+        "cells": [
+            {
+                "cell_type": "markdown",
+                "metadata": {"chat_input": True},
+                "source": ["# Prompt: 1\n"],
+            },
+            {
+                "cell_type": "markdown",
+                "metadata": {
+                    "collapsed": True,
+                    "jupyter": {"source_hidden": True},
+                },
+                "source": ["Thinking\n"],
+            },
+        ],
+    }
+
+    myst_text = mod.notebook_to_md(nb, format=mod.MarkdownFormat.MYST)
+
+    assert '+++ {"chat_input": true}' in myst_text
+    assert '+++ {"collapsed": true, "jupyter": {"source_hidden": true}}' in myst_text
+    assert "---\nchat_input:" not in myst_text
+
+    roundtrip = mod.md_to_notebook(myst_text, format=mod.MarkdownFormat.MYST)
+    assert roundtrip["cells"][0]["metadata"] == {"chat_input": True}
+    assert roundtrip["cells"][1]["metadata"] == {
+        "collapsed": True,
+        "jupyter": {"source_hidden": True},
+    }
+
+
 def test_transform_text_edge_cases():
     scripts_dir = Path(__file__).resolve().parent
     mod = load_transform_module(scripts_dir)
@@ -203,6 +239,52 @@ Second question
     # Reverting expectation: standard doesn't have prompt regexes in registry now.
     out_std = mod.transform_text(text, enabled=["chat_headings"], format="standard")
     assert "# Prompt: 1" not in out_std  # Standard has no regexes!
+
+
+def test_current_chatexport_headings_normalize_and_split():
+    scripts_dir = Path(__file__).resolve().parent
+    mod = load_transform_module(scripts_dir)
+
+    text = """# you asked
+message time: 2026-08-02 23:02:53
+What is graphene?
+
+---
+# gemini response
+Thinking
+
+The answer is carbon.
+"""
+
+    out = mod.transform_text(text, format="chatexport_abc1")
+    assert "# Prompt: 1" in out
+    assert "# Response: 1" in out
+    assert "# you asked" not in out
+    assert "# gemini response" not in out
+
+    nb = mod.md_to_notebook(
+        text,
+        enabled_transforms=[
+            "chat_headings",
+            "chat_input_metadata",
+            "chat_split_m1",
+            "chat_hide_thoughts",
+            "chat_cleanup",
+        ],
+        format="chatexport_abc1",
+    )
+    assert len(nb["cells"]) == 5
+    assert sum(cell["metadata"].get("chat_input") is True for cell in nb["cells"]) == 2
+    thought_cells = [
+        cell
+        for cell in nb["cells"]
+        if cell["metadata"].get("collapsed") is True
+    ]
+    assert len(thought_cells) == 1
+    assert "Thinking" in "".join(thought_cells[0]["source"])
+    assert "Show thinking" not in "".join(
+        "".join(cell["source"]) for cell in nb["cells"]
+    )
 
 
 def test_generate_toc_transform():
