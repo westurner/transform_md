@@ -247,6 +247,80 @@ def _slugify(text: str) -> str:
     return text
 
 
+def _is_top_link_line(line: str) -> bool:
+    """Identify source or generated links that point back to the contents."""
+    normalized = line.strip().lower()
+    return (
+        "top" in normalized
+        and "#table-of-contents" in normalized
+        or "#toptable-of-contents" in normalized
+    )
+
+
+def _normalize_chat_headings(lines: list[str]) -> list[str]:
+    """Keep Gemini chat headings at H2 with nested content starting at H3."""
+    normalized: list[str] = []
+    in_chat = False
+    in_fence = False
+    chat_input_styled = False
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            normalized.append(line)
+            index += 1
+            continue
+
+        if not in_fence and re.match(r"^#+\s+chat-\d+\s*$", stripped, re.I):
+            heading_text = re.sub(r"^#+\s+", "", stripped)
+            normalized.append(f"## {heading_text}")
+            in_chat = True
+            chat_input_styled = False
+            index += 1
+            continue
+
+        if in_chat and not in_fence:
+            setext = (
+                index + 1 < len(lines)
+                and stripped
+                and re.match(r"^\s*(=+|-+)\s*$", lines[index + 1])
+            )
+            if setext:
+                level = 3 if lines[index + 1].strip()[0] == "=" else 4
+                normalized.append(f"{'#' * level} {stripped}")
+                index += 2
+                continue
+
+            if not chat_input_styled and stripped.startswith(">"):
+                normalized.append(":::{div}")
+                normalized.append(":class: chat-input")
+                while index < len(lines) and (
+                    lines[index].strip().startswith(">")
+                    or not lines[index].strip()
+                ):
+                    normalized.append(lines[index])
+                    index += 1
+                normalized.append(":::")
+                chat_input_styled = True
+                continue
+
+            heading = re.match(r"^(#+)\s+(.+)$", stripped)
+            if heading:
+                level = max(3, len(heading.group(1)))
+                normalized.append(f"{'#' * level} {heading.group(2)}")
+                index += 1
+                continue
+
+        normalized.append(line)
+        index += 1
+
+    return normalized
+
+
 def transform_text(
     text: str,
     enabled: Iterable[str] | None = None,
@@ -292,7 +366,9 @@ def transform_text(
     blank_run = 0
     skip_lines = 0
 
-    lines = text.splitlines()
+    lines = [line for line in text.splitlines() if not _is_top_link_line(line)]
+    if config.name == "chatexport_abc1":
+        lines = _normalize_chat_headings(lines)
 
     # Prepend title if requested and not already present as first heading
     # We'll do this later to handle frontmatter correctly
@@ -949,7 +1025,34 @@ def notebook_to_md(
                 lines.append("---")
                 lines.append(yaml.dump(cmeta).strip())
                 lines.append("---")
-            lines.append(source_text.strip())
+            if cmeta.get("chat_input") and source_text.strip():
+                source_lines = source_text.strip().splitlines()
+                prompt_heading = re.match(
+                    r"^(#+\s+(?:Prompt|Response):\s+\d+\s*)$",
+                    source_lines[0],
+                    re.I,
+                )
+                if prompt_heading and len(source_lines) > 1:
+                    lines.append(source_lines[0])
+                    lines.append("")
+                    prompt_body = source_lines[1:]
+                    lines.append(":::{div}")
+                    lines.append(":class: chat-input")
+                    lines.extend(
+                        ">" if not line else f"> {line}"
+                        for line in prompt_body
+                    )
+                    lines.append(":::")
+                else:
+                    lines.append(":::{div}")
+                    lines.append(":class: chat-input")
+                    lines.extend(
+                        ">" if not line else f"> {line}"
+                        for line in source_lines
+                    )
+                    lines.append(":::")
+            else:
+                lines.append(source_text.strip())
             lines.append("")
             last_cell_was_markdown = True
         else:

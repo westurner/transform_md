@@ -287,6 +287,55 @@ The answer is carbon.
     )
 
 
+def test_gemini_chat_headings_and_top_links_are_normalized():
+    scripts_dir = Path(__file__).resolve().parent
+    mod = load_transform_module(scripts_dir)
+
+    text = """# Google Gemini
+
+### chat-1
+
+## Nested section
+#### Nested detail
+
+___
+###### [top](#table-of-contents)
+### chat-2
+
+# Another section
+"""
+
+    out = mod.transform_text(text, format="chatexport_abc1")
+
+    assert "## chat-1" in out
+    assert "### Nested section" in out
+    assert "#### Nested detail" in out
+    assert "[top](#table-of-contents)" not in out
+    assert "\n# Another section\n" not in out
+    assert "\n### Another section\n" in out
+
+
+def test_chat_input_markdown_gets_styled_container():
+    scripts_dir = Path(__file__).resolve().parent
+    mod = load_transform_module(scripts_dir)
+
+    nb = {
+        "metadata": {},
+        "cells": [
+            {
+                "cell_type": "markdown",
+                "metadata": {"chat_input": True},
+                "source": ["# Prompt: 1\n", "\n", "Question with **Markdown**\n"],
+            }
+        ],
+    }
+
+    out = mod.notebook_to_md(nb, format="myst")
+
+    assert ":::{div}\n:class: chat-input" in out
+    assert "> Question with **Markdown**" in out
+
+
 def test_generate_toc_transform():
     scripts_dir = Path(__file__).resolve().parent
     mod = load_transform_module(scripts_dir)
